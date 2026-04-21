@@ -1,7 +1,8 @@
-package notifier
+package sender
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -20,7 +21,7 @@ func NewSlackWebhook(webhook string) *slackWebhook {
 	return &slackWebhook{webhook}
 }
 
-func (sw *slackWebhook) Send(message string) error {
+func (sw *slackWebhook) Send(ctx context.Context, message string, properties ...MessageProperty) error {
 	payload := slackPayload{
 		Text: message,
 	}
