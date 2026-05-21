@@ -36,8 +36,8 @@ func (dw *discordWebhook) Send(ctx context.Context, message string, properties .
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("slack responded with non-200 status: %s", resp.Status)
+	if resp.StatusCode != http.StatusNoContent {
+		return fmt.Errorf("discord responded with non-200 status: %s", resp.Status)
 	}
 
 	return nil
