@@ -1,6 +1,6 @@
 
 
-.PHONY: all build fmt lint
+.PHONY: all build fmt lint test
 
 all: build fmt lint
 
@@ -12,3 +12,6 @@ fmt:
 
 lint:
 	@golangci-lint run ./...
+
+test:
+	@go test -count=1 ./...
