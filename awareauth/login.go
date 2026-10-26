@@ -13,8 +13,6 @@ import (
 	"github.com/julienschmidt/httprouter"
 )
 
-const dashboardPath = "/dashboard"
-
 type LoginHook interface {
 	OnLogin(ctx context.Context, sub string) error
 }
@@ -70,30 +68,39 @@ func Callback(svc Service, hook LoginHook) httprouter.Handle {
 		ctx := r.Context()
 		logger := logs.FromContext(ctx)
 
+		// Cleared up front so every outcome, failure included, drops the state.
+		http.SetCookie(w, &http.Cookie{Name: stateCookie, Value: "", Path: "/", HttpOnly: true, MaxAge: -1})
+
+		fail := func(status int, msg string, err error) {
+			logger.Error().Err(err).Str("error_param", r.URL.Query().Get("error")).Msg("Login callback failed: " + msg)
+			if p := svc.LoginErrorPath(); p != "" {
+				http.Redirect(w, r, p, http.StatusFound)
+				return
+			}
+			http.Error(w, msg, status)
+		}
+
 		cookie, err := r.Cookie(stateCookie)
 		if err != nil || cookie.Value == "" || cookie.Value != r.URL.Query().Get("state") {
-			http.Error(w, "invalid state", http.StatusBadRequest)
+			fail(http.StatusBadRequest, "invalid state", err)
 			return
 		}
-		http.SetCookie(w, &http.Cookie{Name: stateCookie, Value: "", Path: "/", HttpOnly: true, MaxAge: -1})
 
 		code := r.URL.Query().Get("code")
 		if code == "" {
-			http.Error(w, "missing code", http.StatusBadRequest)
+			fail(http.StatusBadRequest, "missing code", nil)
 			return
 		}
 
 		tokens, err := svc.Exchange(ctx, code, r.Header.Get("User-Agent"), clientIP(r))
 		if err != nil {
-			logger.Error().Err(err).Msg("Code exchange failed")
-			http.Error(w, "code exchange failed", http.StatusBadGateway)
+			fail(http.StatusBadGateway, "code exchange failed", err)
 			return
 		}
 
 		sub, _, err := svc.Verify(ctx, tokens.AccessToken)
 		if err != nil {
-			logger.Error().Err(err).Msg("Access token verification failed")
-			http.Error(w, "invalid access token", http.StatusBadGateway)
+			fail(http.StatusBadGateway, "invalid access token", err)
 			return
 		}
 
@@ -104,7 +111,7 @@ func Callback(svc Service, hook LoginHook) httprouter.Handle {
 		}
 
 		svc.EstablishSession(w, tokens)
-		http.Redirect(w, r, dashboardPath, http.StatusFound)
+		http.Redirect(w, r, svc.AfterLoginPath(), http.StatusFound)
 	}
 }
 
@@ -120,6 +127,7 @@ func Me(svc Service) httprouter.Handle {
 	}
 }
 
+// Refresh must be mounted at Config.RefreshPath: the refresh cookie is scoped to it.
 func Refresh(svc Service) httprouter.Handle {
 	return func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 		ctx := r.Context()

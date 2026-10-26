@@ -19,13 +19,16 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/bmatei/libgo/config"
+	"github.com/bmatei/libgo/observability/logs"
 )
 
 const (
 	stateCookie   = "aware_oauth_state"
 	accessCookie  = "app_access"
 	refreshCookie = "app_refresh"
-	refreshPath   = "/refresh"
+
+	defaultAfterLoginPath = "/dashboard"
+	defaultRefreshPath    = "/refresh"
 )
 
 var errInvalidToken = errors.New("invalid access token")
@@ -60,11 +63,16 @@ type Config struct {
 	AppID             string          `env:"APP_ID"`
 	APIKey            string          `env:"API_KEY"`
 	CallbackURL       string          `env:"CALLBACK_URL" env-default:"http://localhost:8080/callback"`
+	AfterLoginPath    string          `env:"AFTER_LOGIN_PATH" env-default:"/dashboard"`
+	LoginErrorPath    string          `env:"LOGIN_ERROR_PATH"`
+	RefreshPath       string          `env:"REFRESH_PATH" env-default:"/refresh"`
 	HttpClientTimeout config.Duration `env:"HTTP_CLIENT_TIMEOUT" env-default:"10s"`
 }
 
 type Service interface {
 	AuthorizeURL(state string) string
+	AfterLoginPath() string
+	LoginErrorPath() string
 
 	Exchange(ctx context.Context, code, userAgent, clientIP string) (Tokens, error)
 	Refresh(ctx context.Context, refreshToken, userAgent, clientIP string) (Tokens, error)
@@ -95,8 +103,33 @@ type client struct {
 
 var _ Service = (*client)(nil)
 
+// New returns nil if a configured path is not a same-origin path.
 func New(cfg Config) *client {
 	cfg.AwareOrigin = strings.TrimRight(cfg.AwareOrigin, "/")
+
+	if cfg.AfterLoginPath == "" {
+		cfg.AfterLoginPath = defaultAfterLoginPath
+	}
+
+	if cfg.RefreshPath == "" {
+		cfg.RefreshPath = defaultRefreshPath
+	}
+
+	logger := logs.FromContext(context.Background())
+	for name, path := range map[string]string{
+		"AFTER_LOGIN_PATH": cfg.AfterLoginPath,
+		"REFRESH_PATH":     cfg.RefreshPath,
+	} {
+		if !isLocalPath(path) {
+			logger.Error().Str("path", path).Msgf("Invalid %s: must be a same-origin path", name)
+			return nil
+		}
+	}
+
+	if cfg.LoginErrorPath != "" && !isLocalPath(cfg.LoginErrorPath) {
+		logger.Error().Str("path", cfg.LoginErrorPath).Msg("Invalid LOGIN_ERROR_PATH: must be a same-origin path")
+		return nil
+	}
 
 	return &client{
 		cfg:        cfg,
@@ -105,6 +138,19 @@ func New(cfg Config) *client {
 		audience:   cfg.AppID,
 		pubKeysURL: cfg.AwareOrigin + "/.well-known/jwks.json",
 	}
+}
+
+// isLocalPath rejects anything a browser could resolve to another origin.
+func isLocalPath(p string) bool {
+	return strings.HasPrefix(p, "/") && !strings.HasPrefix(p, "//") && !strings.HasPrefix(p, "/\\")
+}
+
+func (c *client) AfterLoginPath() string {
+	return c.cfg.AfterLoginPath
+}
+
+func (c *client) LoginErrorPath() string {
+	return c.cfg.LoginErrorPath
 }
 
 func (c *client) AuthorizeURL(state string) string {
@@ -369,7 +415,7 @@ func (c *client) EstablishSession(w http.ResponseWriter, tokens Tokens) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     refreshCookie,
 		Value:    tokens.RefreshToken,
-		Path:     refreshPath,
+		Path:     c.cfg.RefreshPath,
 		HttpOnly: true,
 		Secure:   true,
 		SameSite: http.SameSiteStrictMode,
@@ -382,7 +428,7 @@ func (c *client) ClearSession(w http.ResponseWriter) {
 		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode, MaxAge: -1,
 	})
 	http.SetCookie(w, &http.Cookie{
-		Name: refreshCookie, Value: "", Path: refreshPath,
+		Name: refreshCookie, Value: "", Path: c.cfg.RefreshPath,
 		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode, MaxAge: -1,
 	})
 }
