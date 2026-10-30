@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,14 +30,36 @@ const (
 
 	defaultAfterLoginPath = "/dashboard"
 	defaultRefreshPath    = "/refresh"
+
+	// jwksRefetchCooldown bounds how often an unknown kid can trigger a JWKS fetch,
+	// so forged tokens or webhooks can't make us hammer Aware.
+	jwksRefetchCooldown = time.Minute
 )
 
-var errInvalidToken = errors.New("invalid access token")
+var (
+	errInvalidToken = errors.New("invalid access token")
+	errUnknownKey   = errors.New("unknown signing key")
+)
 
 var (
 	ErrWrongPassword = errors.New("current password is incorrect")
 	ErrBadPassword   = errors.New("new password rejected")
+	ErrRateLimited   = errors.New("rate limited")
 )
+
+// RateLimitedError is returned when Aware answers 429; errors.Is(err, ErrRateLimited)
+// matches it. RetryAfter is zero when Aware didn't say.
+type RateLimitedError struct {
+	RetryAfter time.Duration
+}
+
+func (e *RateLimitedError) Error() string {
+	return fmt.Sprintf("rate limited, retry after %s", e.RetryAfter)
+}
+
+func (e *RateLimitedError) Is(target error) bool {
+	return target == ErrRateLimited
+}
 
 type AwareProfile struct {
 	FullName      string `json:"full_name"`
@@ -71,12 +94,14 @@ type Config struct {
 
 type Service interface {
 	AuthorizeURL(state string) string
+	RegisterURL(state string) string
 	AfterLoginPath() string
 	LoginErrorPath() string
 
 	Exchange(ctx context.Context, code, userAgent, clientIP string) (Tokens, error)
 	Refresh(ctx context.Context, refreshToken, userAgent, clientIP string) (Tokens, error)
 	Verify(ctx context.Context, accessToken string) (sub, familyID string, err error)
+	PublicKey(ctx context.Context, kid string) (*rsa.PublicKey, error)
 
 	EstablishSession(w http.ResponseWriter, tokens Tokens)
 	ClearSession(w http.ResponseWriter)
@@ -89,6 +114,7 @@ type Service interface {
 	SetFullName(ctx context.Context, accessToken, fullName string) (AwareProfile, error)
 	ChangePassword(ctx context.Context, accessToken, current, newPassword string) error
 	DeleteAccount(ctx context.Context, accessToken, current string) error
+	ResendVerification(ctx context.Context, accessToken string) error
 }
 
 type client struct {
@@ -97,6 +123,7 @@ type client struct {
 	audience    string
 	pubKeyCache map[string]*rsa.PublicKey
 	pubKeysURL  string
+	lastFetch   time.Time
 	mu          sync.Mutex
 	http        *http.Client
 }
@@ -154,7 +181,15 @@ func (c *client) LoginErrorPath() string {
 }
 
 func (c *client) AuthorizeURL(state string) string {
-	return c.cfg.AwareOrigin + "/authorize?" + url.Values{
+	return c.flowURL("/authorize", state)
+}
+
+func (c *client) RegisterURL(state string) string {
+	return c.flowURL("/register", state)
+}
+
+func (c *client) flowURL(path, state string) string {
+	return c.cfg.AwareOrigin + path + "?" + url.Values{
 		"app":          {c.cfg.AppID},
 		"redirect_uri": {c.cfg.CallbackURL},
 		"state":        {state},
@@ -223,7 +258,7 @@ func (c *client) Verify(ctx context.Context, accessToken string) (string, string
 	var claims jwt.MapClaims
 	_, err := jwt.ParseWithClaims(accessToken, &claims, func(t *jwt.Token) (interface{}, error) {
 		kid, _ := t.Header["kid"].(string)
-		return c.keyForKid(ctx, kid)
+		return c.PublicKey(ctx, kid)
 	},
 		jwt.WithValidMethods([]string{"RS256"}),
 		jwt.WithIssuer(c.issuer),
@@ -403,6 +438,46 @@ func (c *client) DeleteAccount(ctx context.Context, accessToken, current string)
 	}
 }
 
+func (c *client) ResendVerification(ctx context.Context, accessToken string) error {
+	resp, err := c.identityRequest(ctx, http.MethodPost, c.identityMeURL("verification"), accessToken, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	switch resp.StatusCode {
+	case http.StatusNoContent:
+		return nil
+	case http.StatusTooManyRequests:
+		return &RateLimitedError{RetryAfter: retryAfter(resp)}
+	default:
+		return fmt.Errorf("verification resend returned %d", resp.StatusCode)
+	}
+}
+
+// retryAfter reads the body's retry_after (seconds), falling back to the
+// Retry-After header (seconds or HTTP date).
+func retryAfter(resp *http.Response) time.Duration {
+	var body struct {
+		RetryAfter int `json:"retry_after"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&body); err == nil && body.RetryAfter > 0 {
+		return time.Duration(body.RetryAfter) * time.Second
+	}
+
+	h := resp.Header.Get("Retry-After")
+	if secs, err := strconv.Atoi(h); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(h); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+
+	return 0
+}
+
 func (c *client) EstablishSession(w http.ResponseWriter, tokens Tokens) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     accessCookie,
@@ -447,7 +522,10 @@ func (c *client) Session(r *http.Request) (string, string, bool) {
 	return sub, familyID, true
 }
 
-func (c *client) keyForKid(ctx context.Context, kid string) (*rsa.PublicKey, error) {
+// PublicKey returns Aware's JWKS key for kid. An unknown kid refetches the JWKS at
+// most once per jwksRefetchCooldown; errUnknownKey means it is still unknown, any
+// other error means the JWKS couldn't be fetched.
+func (c *client) PublicKey(ctx context.Context, kid string) (*rsa.PublicKey, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -455,15 +533,20 @@ func (c *client) keyForKid(ctx context.Context, kid string) (*rsa.PublicKey, err
 		return key, nil
 	}
 
+	if time.Since(c.lastFetch) < jwksRefetchCooldown {
+		return nil, errUnknownKey
+	}
+	c.lastFetch = time.Now()
+
 	keys, err := c.fetchPubKeys(ctx)
 	if err != nil {
-		return nil, errInvalidToken
+		return nil, err
 	}
 	c.pubKeyCache = keys
 
 	key, ok := keys[kid]
 	if !ok {
-		return nil, errInvalidToken
+		return nil, errUnknownKey
 	}
 
 	return key, nil

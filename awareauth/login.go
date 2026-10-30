@@ -36,6 +36,17 @@ func Family(ctx context.Context) string {
 }
 
 func Login(svc Service) httprouter.Handle {
+	return startFlow(svc.AuthorizeURL)
+}
+
+// Register is Login sent to Aware's sign-up page; Aware falls back to its login
+// page when registration is off.
+func Register(svc Service) httprouter.Handle {
+	return startFlow(svc.RegisterURL)
+}
+
+// startFlow sets the state cookie Callback checks and redirects to Aware.
+func startFlow(awareURL func(state string) string) httprouter.Handle {
 	return func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 		state, err := randomToken()
 		if err != nil {
@@ -51,7 +62,7 @@ func Login(svc Service) httprouter.Handle {
 			SameSite: http.SameSiteLaxMode,
 			MaxAge:   600,
 		})
-		http.Redirect(w, r, svc.AuthorizeURL(state), http.StatusFound)
+		http.Redirect(w, r, awareURL(state), http.StatusFound)
 	}
 }
 

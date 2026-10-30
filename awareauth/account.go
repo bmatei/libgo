@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
+	"strconv"
 
 	"github.com/bmatei/libgo/observability/logs"
 	"github.com/julienschmidt/httprouter"
@@ -118,6 +120,30 @@ func DeleteAccount(svc Service, hook EraseHook) httprouter.Handle {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "current password is incorrect"})
 		default:
 			logger.Error().Err(err).Msg("Account deletion failed")
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "couldn't reach Aware, try again"})
+		}
+	}
+}
+
+func ResendVerificationHandler(svc Service) httprouter.Handle {
+	return func(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
+		ctx := r.Context()
+		logger := logs.FromContext(ctx)
+
+		err := svc.ResendVerification(ctx, accessToken(r))
+		var rl *RateLimitedError
+		switch {
+		case err == nil:
+			w.WriteHeader(http.StatusNoContent)
+		case errors.As(err, &rl):
+			secs := int(math.Ceil(rl.RetryAfter.Seconds()))
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+			writeJSON(w, http.StatusTooManyRequests, map[string]any{
+				"error":       "verification email sent recently, try again later",
+				"retry_after": secs,
+			})
+		default:
+			logger.Error().Err(err).Msg("Verification resend failed")
 			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "couldn't reach Aware, try again"})
 		}
 	}
